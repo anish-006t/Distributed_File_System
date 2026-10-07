@@ -27,6 +27,18 @@ typedef struct {
 static NMState *G_ST = NULL;
 static int G_RR_CURSOR = 0; // simple round-robin cursor for server selection
 
+// Per-file replica sync serialization (lock striping by filename hash).
+// Each sync reads the primary *after* acquiring the stripe, so the last sync to
+// run always pushes the newest primary content and replicas cannot regress.
+#define SYNC_STRIPES 64
+static pthread_mutex_t G_SYNC_STRIPES[SYNC_STRIPES];
+
+static pthread_mutex_t *sync_stripe(const char *name) {
+    unsigned long h = 5381;
+    for (const unsigned char *p = (const unsigned char*)name; *p; ++p) h = h * 33 + *p;
+    return &G_SYNC_STRIPES[h % SYNC_STRIPES];
+}
+
 // Logging helpers: now only write to log file (no terminal echo) per user request
 static void nm_info(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -96,7 +108,7 @@ static int ss_send_simple(const char *host, uint16_t port, const char *line, cha
         char *acc = NULL; size_t cap = 0, len = 0;
         while (1) {
             ssize_t m = su_recv_line(fd, buf, sizeof(buf));
-            if (m <= 0) { break; }
+            if (m < 0) { break; }
             if (strcmp(buf, ".") == 0) break;
             size_t bl = strlen(buf);
             if (len + bl + 2 > cap) { cap = cap ? cap*2 : 4096; acc = (char*)realloc(acc, cap); }
@@ -177,6 +189,28 @@ static StorageServerRef *get_available_server(FileMeta *fm) {
         if (test_fd >= 0) { su_close(test_fd); return ssr; }
     }
     return fm->storage_servers; // ultimate fallback
+}
+
+// Read from the primary replica, falling back to the others only if it fails
+static int ss_read_with_failover(FileMeta *fm, const char *request, char **out_text) {
+    if (!fm || !fm->storage_servers) return -1;
+    StorageServerRef *primary = get_primary_server(fm);
+    char *text = NULL;
+    if (primary && ss_send_simple(primary->host, primary->port, request, &text) == 0) {
+        *out_text = text;
+        return 0;
+    }
+    free(text);
+    for (StorageServerRef *ssr = fm->storage_servers; ssr; ssr = ssr->next) {
+        if (ssr == primary) continue;
+        text = NULL;
+        if (ss_send_simple(ssr->host, ssr->port, request, &text) == 0) {
+            *out_text = text;
+            return 0;
+        }
+        free(text);
+    }
+    return -1;
 }
 static void send_text_lines(int fd, const char *text) {
     // text may be NULL
@@ -815,7 +849,9 @@ static void *conn_thread(void *arg) {
         char *tok[4]; int tc; char tmp[PROTO_MAX_LINE]; snprintf(tmp, sizeof(tmp), "%s", first); tc = str_split_ws(tmp, tok, 4);
         if (tc == 2) {
             uint16_t port = (uint16_t)atoi(tok[1]);
+            pthread_mutex_lock(&G_ST->state_mutex);
             nm_add_ss(G_ST, ci->peer_ip, port);
+            pthread_mutex_unlock(&G_ST->state_mutex);
             nm_info("REGISTER_SS from %s:%u -> port=%u", ci->peer_ip, ci->peer_port, port);
             proto_send_ok(fd);
             
@@ -1037,7 +1073,7 @@ static void *conn_thread(void *arg) {
                 if (!fm) { proto_send_err(fd, ERR_NOT_FOUND, "No such file"); continue; }
                 if (!nm_user_has_read(fm, username)) { proto_send_err(fd, ERR_FORBIDDEN, "No access"); continue; }
                 char req[PROTO_MAX_LINE]; snprintf(req, sizeof(req), "READ %s", fm->name);
-                char *text = NULL; int rc = ss_send_to_all(fm, req, &text);
+                char *text = NULL; int rc = ss_read_with_failover(fm, req, &text);
                 if (rc == 0) {
                     pthread_mutex_lock(&G_ST->state_mutex);
                     update_stats_from_text(fm, text, username);
@@ -1139,10 +1175,16 @@ static void *conn_thread(void *arg) {
                 if (!nm_user_has_write(fm, username)) { proto_send_err(fd, ERR_FORBIDDEN, "No write access"); continue; }
                 char req[PROTO_MAX_LINE]; snprintf(req, sizeof(req), "WRITE %s %s %s", fm->name, tokens[2], username);
                 
-                StorageServerRef *server = get_available_server(fm);
+                StorageServerRef *server = get_primary_server(fm);
                 if (!server) { proto_send_err(fd, ERR_INTERNAL, "No available servers"); continue; }
-                
+
                 int fdss = su_connect(server->host, server->port);
+                // Primary may have died before the health checker noticed: fail over in replica order
+                for (StorageServerRef *alt = fm->storage_servers; fdss < 0 && alt; alt = alt->next) {
+                    if (alt == server) continue;
+                    fdss = su_connect(alt->host, alt->port);
+                    if (fdss >= 0) server = alt;
+                }
                 if (fdss < 0) { proto_send_err(fd, ERR_INTERNAL, "SS connect"); continue; }
                 if (su_send_line(fdss, req) < 0) { su_close(fdss); proto_send_err(fd, ERR_INTERNAL, "SS send"); continue; }
                 char resp0[PROTO_MAX_LINE];
@@ -1161,6 +1203,8 @@ static void *conn_thread(void *arg) {
                         if (r > 0 && strncmp(resp2, "OK", 2) == 0) {
                             // CRITICAL: Synchronize content to ALL replicas after write
                             // Read content from the primary server we just wrote to
+                            pthread_mutex_t *wstripe = sync_stripe(fm->name);
+                            pthread_mutex_lock(wstripe);
                             int sync_fd = su_connect(server->host, server->port);
                             if (sync_fd >= 0) {
                                 char read_req[PROTO_MAX_LINE]; snprintf(read_req, sizeof(read_req), "READ %s", fm->name);
@@ -1183,7 +1227,7 @@ static void *conn_thread(void *arg) {
                                     char content_line[PROTO_MAX_LINE];
                                     while (1) {
                                         ssize_t ln = su_recv_line(sync_fd, content_line, sizeof(content_line));
-                                        if (ln <= 0) break;
+                                        if (ln < 0) break;
                                         if (strcmp(content_line, ".") == 0) {
                                             for (int i = 0; i < sync_count; ++i) {
                                                 su_send_line(sync_dests[i].fd, ".");
@@ -1222,6 +1266,7 @@ static void *conn_thread(void *arg) {
                                     su_close(sync_fd);
                                 }
                             }
+                            pthread_mutex_unlock(wstripe);
                             proto_send_text_block(fd, "Write successful");
                         }
                         else if (r > 0 && strncmp(resp2, "ERR", 3) == 0) proto_send_err(fd, ERR_RANGE, resp2 + 4);
@@ -1236,15 +1281,18 @@ static void *conn_thread(void *arg) {
                 const char *fname = tokens[1]; const char *mode = tokens[2]; const char *actor = tokens[3];
                 FileMeta *fm = nm_get_file(G_ST, fname);
                 if (!fm) { proto_send_err(fd, ERR_NOT_FOUND, "No such file"); continue; }
-                StorageServerRef *source = get_available_server(fm);
+                StorageServerRef *source = get_primary_server(fm);
                 if (!source) { proto_send_err(fd, ERR_INTERNAL, "No storage server"); continue; }
+                pthread_mutex_t *stripe = sync_stripe(fm->name);
+                pthread_mutex_lock(stripe);
                 int sfd = su_connect(source->host, source->port);
-                if (sfd < 0) { proto_send_err(fd, ERR_INTERNAL, "Source connect failed"); continue; }
+                if (sfd < 0) { pthread_mutex_unlock(stripe); proto_send_err(fd, ERR_INTERNAL, "Source connect failed"); continue; }
                 char req[PROTO_MAX_LINE]; snprintf(req, sizeof(req), "READ %s", fm->name);
-                if (su_send_line(sfd, req) < 0) { su_close(sfd); proto_send_err(fd, ERR_INTERNAL, "Source send failed"); continue; }
+                if (su_send_line(sfd, req) < 0) { su_close(sfd); pthread_mutex_unlock(stripe); proto_send_err(fd, ERR_INTERNAL, "Source send failed"); continue; }
                 char r0[PROTO_MAX_LINE];
                 if (su_recv_line(sfd, r0, sizeof(r0)) <= 0 || strncmp(r0, "OK", 2) != 0) {
                     su_close(sfd);
+                    pthread_mutex_unlock(stripe);
                     proto_send_err(fd, ERR_INTERNAL, "Source read failed");
                     continue;
                 }
@@ -1262,7 +1310,7 @@ static void *conn_thread(void *arg) {
                 char linebuf[PROTO_MAX_LINE];
                 while (1) {
                     ssize_t rn = su_recv_line(sfd, linebuf, sizeof(linebuf));
-                    if (rn <= 0) { break; }
+                    if (rn < 0) { break; }
                     if (strcmp(linebuf, ".") == 0) {
                         for (int i = 0; i < nd; ++i) {
                             su_send_line(dests[i].fd, ".");
@@ -1283,6 +1331,7 @@ static void *conn_thread(void *arg) {
                     total_chars++; in_word = 0;
                 }
                 su_close(sfd);
+                pthread_mutex_unlock(stripe);
                 pthread_mutex_lock(&G_ST->state_mutex);
                 fm->chars = total_chars;
                 fm->words = total_words;
@@ -1301,7 +1350,7 @@ static void *conn_thread(void *arg) {
                 FileMeta *fm = nm_get_file(G_ST, tokens[1]);
                 if (!fm) { proto_send_err(fd, ERR_NOT_FOUND, "No such file"); continue; }
                 if (!nm_user_has_write(fm, username)) { proto_send_err(fd, ERR_FORBIDDEN, "No write access"); continue; }
-                StorageServerRef *server = get_available_server(fm);
+                StorageServerRef *server = get_primary_server(fm);
                 if (!server) { proto_send_err(fd, ERR_INTERNAL, "No available servers"); continue; }
                 proto_send_ok(fd);
                 char out[256]; snprintf(out, sizeof(out), "CONNECT %s %u %s", server->host, server->port, fm->name);
@@ -1341,7 +1390,7 @@ static void *conn_thread(void *arg) {
                 if (!fm) { proto_send_err(fd, ERR_NOT_FOUND, "No such file"); continue; }
                 if (!nm_user_has_read(fm, username)) { proto_send_err(fd, ERR_FORBIDDEN, "No access"); continue; }
                 char req[PROTO_MAX_LINE]; snprintf(req, sizeof(req), "READ %s", fm->name);
-                char *text = NULL; int rc = ss_send_to_all(fm, req, &text);
+                char *text = NULL; int rc = ss_read_with_failover(fm, req, &text);
                 if (rc != 0) { proto_send_err(fd, ERR_INTERNAL, "SS error"); continue; }
                 if (!text) text = strdup("");
                 int exit_code = 0; char *out = exec_capture_bash(text, &exit_code);
@@ -1396,6 +1445,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     log_init("nm.log");
+    for (int i = 0; i < SYNC_STRIPES; ++i) pthread_mutex_init(&G_SYNC_STRIPES[i], NULL);
     G_ST = nm_state_load(data_dir);
 
     // Start health checker thread

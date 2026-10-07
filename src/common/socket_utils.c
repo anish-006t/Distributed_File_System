@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 
 int su_listen(uint16_t port, int backlog) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -43,26 +44,35 @@ int su_accept(int server_fd, char *peer_ip, size_t ip_len, uint16_t *peer_port) 
         if (!p && ip_len > 0) peer_ip[0] = '\0';
     }
     if (peer_port) *peer_port = ntohs(addr.sin_port);
+    // Line protocol sends many small writes; disable Nagle to avoid ~40ms delayed-ACK stalls
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     return fd;
 }
 
 int su_connect(const char *host, uint16_t port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    // getaddrinfo is thread-safe (gethostbyname returns a shared static buffer
+    // and crashed the NM when many client threads connected concurrently)
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[8];
+    snprintf(portstr, sizeof(portstr), "%u", port);
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -1;
 
-    struct hostent *he = gethostbyname(host);
-    if (!he) { close(fd); return -1; }
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return -1; }
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    memcpy(&addr.sin_addr, he->h_addr, he->h_length);
-    addr.sin_port = htons(port);
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
         close(fd);
+        freeaddrinfo(res);
         return -1;
     }
+    freeaddrinfo(res);
     return fd;
 }
 

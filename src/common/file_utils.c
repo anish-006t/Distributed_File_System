@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 
 int fu_mkdirs(const char *path) {
     char tmp[1024];
@@ -50,11 +51,19 @@ int fu_write_all(const char *path, const char *data, size_t len) {
     snprintf(dir, sizeof(dir), "%s", path);
     char *slash = strrchr(dir, '/');
     if (slash) { *slash = '\0'; fu_mkdirs(dir); }
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
+    // Write to a unique temp file then rename(), so concurrent readers never
+    // observe a truncated/partially written file (rename is atomic on POSIX)
+    char tmp[1100];
+    snprintf(tmp, sizeof(tmp), "%s.XXXXXX", path);
+    int fd = mkstemp(tmp);
+    if (fd < 0) return -1;
+    fchmod(fd, 0644);
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { close(fd); unlink(tmp); return -1; }
     size_t w = fwrite(data, 1, len, f);
-    fclose(f);
-    return w == len ? 0 : -1;
+    if (fclose(f) != 0 || w != len) { unlink(tmp); return -1; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    return 0;
 }
 
 int fu_copy_file(const char *src, const char *dst) {

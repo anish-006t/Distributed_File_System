@@ -1,0 +1,16 @@
+# Build output (make)
+bin/
+build/
+*.o
+
+# Runtime data created by running nm / ss
+/nm_data/
+/ss_data/
+*.log
+*.sync.tmp
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

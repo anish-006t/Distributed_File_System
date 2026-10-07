@@ -29,6 +29,26 @@ static void free_filemeta(void *p) {
     free(f);
 }
 
+static StorageServer *find_ss(NMState *st, const char *host, uint16_t port) {
+    for (StorageServer *s = st->ss_list; s; s = s->next)
+        if (s->port == port && strcmp(s->host, host) == 0) return s;
+    return NULL;
+}
+
+static StorageServer *new_ss(NMState *st, const char *host, uint16_t port, bool healthy) {
+    StorageServer *ss = (StorageServer*)calloc(1, sizeof(StorageServer));
+    ss->host = strdup(host);
+    ss->port = port;
+    ss->id = st->next_ss_id++;
+    ss->healthy = healthy;
+    ss->fail_count = 0;
+    ss->last_check = healthy ? time(NULL) : 0;
+    ss->last_ok = ss->last_check;
+    ss->next = st->ss_list;
+    st->ss_list = ss;
+    return ss;
+}
+
 NMState *nm_state_load(const char *data_dir) {
     NMState *st = (NMState*)calloc(1, sizeof(NMState));
     snprintf(st->data_dir, sizeof(st->data_dir), "%s", data_dir);
@@ -46,7 +66,10 @@ NMState *nm_state_load(const char *data_dir) {
     size_t len; char *data = fu_read_all(idx, &len);
     if (!data) return st; // empty
 
-    char *line = strtok(data, "\n");
+    // strtok_r: nested plain strtok calls share one cursor, which silently
+    // stopped loading after the first file in index.tsv
+    char *save_line = NULL;
+    char *line = strtok_r(data, "\n", &save_line);
     while (line) {
         // Enhanced format: name|owner|words|chars|created|modified|last_access|last_accessor|servers|acl
         // Fall back to old format if needed: name\towner\tservers
@@ -54,10 +77,11 @@ NMState *nm_state_load(const char *data_dir) {
             // New enhanced format
             char *parts[10];
             int part_count = 0;
-            char *token = strtok(line, "|");
+            char *save_part = NULL;
+            char *token = strtok_r(line, "|", &save_part);
             while (token && part_count < 10) {
                 parts[part_count++] = token;
-                token = strtok(NULL, "|");
+                token = strtok_r(NULL, "|", &save_part);
             }
             
             if (part_count >= 9) {
@@ -72,7 +96,8 @@ NMState *nm_state_load(const char *data_dir) {
                 if (strlen(parts[7]) > 0) fm->last_accessor = strdup(parts[7]);
                 
                 // Parse storage servers
-                char *server_token = strtok(parts[8], ",");
+                char *save_srv = NULL;
+                char *server_token = strtok_r(parts[8], ",", &save_srv);
                 StorageServerRef *prev_ssr = NULL;
                 while (server_token) {
                     char host[256]; int port;
@@ -87,18 +112,19 @@ NMState *nm_state_load(const char *data_dir) {
                         }
                         prev_ssr = ssr;
                     }
-                    server_token = strtok(NULL, ",");
+                    server_token = strtok_r(NULL, ",", &save_srv);
                 }
                 
                 // Parse ACL
                 if (part_count > 9 && strlen(parts[9]) > 0) {
-                    char *acl_token = strtok(parts[9], ",");
+                    char *save_acl = NULL;
+                    char *acl_token = strtok_r(parts[9], ",", &save_acl);
                     while (acl_token) {
                         char user[256]; char perm;
                         if (sscanf(acl_token, "%255[^:]:%c", user, &perm) == 2) {
                             nm_acl_grant(fm, user, perm == 'w');
                         }
-                        acl_token = strtok(NULL, ",");
+                        acl_token = strtok_r(NULL, ",", &save_acl);
                     }
                 } else {
                     // Grant owner RW by default if no ACL
@@ -117,7 +143,8 @@ NMState *nm_state_load(const char *data_dir) {
                 fm->created = fm->modified = fm->last_access = time(NULL);
                 
                 // Parse storage servers
-                char *server_token = strtok(servers, ",");
+                char *save_old = NULL;
+                char *server_token = strtok_r(servers, ",", &save_old);
                 StorageServerRef *prev_ssr = NULL;
                 while (server_token) {
                     char host[256]; int port;
@@ -132,7 +159,7 @@ NMState *nm_state_load(const char *data_dir) {
                         }
                         prev_ssr = ssr;
                     }
-                    server_token = strtok(NULL, ",");
+                    server_token = strtok_r(NULL, ",", &save_old);
                 }
                 
                 hm_put(st->files, fm->name, fm, NULL);
@@ -140,9 +167,22 @@ NMState *nm_state_load(const char *data_dir) {
                 nm_acl_grant(fm, owner, true);
             }
         }
-        line = strtok(NULL, "\n");
+        line = strtok_r(NULL, "\n", &save_line);
     }
     free(data);
+
+    // Rebuild the storage server list from persisted replica refs. SSs only register
+    // once at startup, so without this a restarted NM could not place new files.
+    for (size_t i = 0; i < st->files->nbuckets; ++i) {
+        for (HMEntry *e = st->files->buckets[i]; e; e = e->next) {
+            FileMeta *fm = (FileMeta*)e->value;
+            for (StorageServerRef *ssr = fm->storage_servers; ssr; ssr = ssr->next) {
+                StorageServer *ss = find_ss(st, ssr->host, ssr->port);
+                if (!ss) ss = new_ss(st, ssr->host, ssr->port, false); // health thread confirms
+                ssr->id = ss->id;
+            }
+        }
+    }
     
     // Load user sessions
     char sessions_file[1024]; snprintf(sessions_file, sizeof(sessions_file), "%s/sessions.dat", data_dir);
@@ -343,16 +383,16 @@ bool nm_user_exists(NMState *st, const char *user) {
 }
 
 void nm_add_ss(NMState *st, const char *host, uint16_t port) {
-    StorageServer *ss = (StorageServer*)calloc(1, sizeof(StorageServer));
-    ss->host = strdup(host);
-    ss->port = port;
-    ss->id = st->next_ss_id++;
-    ss->healthy = false; // unknown until first check
-    ss->fail_count = 0;
-    ss->last_check = 0;
-    ss->last_ok = 0;
-    ss->next = st->ss_list;
-    st->ss_list = ss;
+    // It just registered over TCP, so it is reachable. Starting it as unhealthy made
+    // files created before the first health sweep get fewer than 3 replicas.
+    StorageServer *ss = find_ss(st, host, port);
+    if (ss) { // re-registration (SS or NM restart): reuse id so file refs stay valid
+        ss->healthy = true;
+        ss->fail_count = 0;
+        ss->last_check = ss->last_ok = time(NULL);
+        return;
+    }
+    new_ss(st, host, port, true);
 }
 
 StorageServerRef *nm_pick_storage_servers(NMState *st, int count) {

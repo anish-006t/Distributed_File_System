@@ -14,7 +14,7 @@ static int expect_ok_block(int fd, char *buf, size_t bufsz) {
     // read until '.'
     while (1) {
         n = su_recv_line(fd, buf, bufsz);
-        if (n <= 0) return -1;
+        if (n < 0) return -1; // empty lines are valid payload
         if (strcmp(buf, ".") == 0) break;
         // accumulate if needed
     }
@@ -29,7 +29,7 @@ static int expect_ok_collect(int fd, char **out) {
     size_t cap = 4096, len = 0; char *acc = malloc(cap);
     while (1) {
         ssize_t m = su_recv_line(fd, line, sizeof(line));
-        if (m <= 0) { free(acc); return -1; }
+        if (m < 0) { free(acc); return -1; } // empty lines are valid payload
         if (strcmp(line, ".") == 0) break;
         size_t bl = strlen(line);
         if (len + bl + 2 > cap) { cap*=2; acc = realloc(acc, cap); }

@@ -24,6 +24,8 @@ static char G_NM_HOST[128];
 static uint16_t G_NM_PORT = 0;
 static uint16_t G_SS_PORT = 0;
 static pthread_mutex_t G_LOCK_MUTEX = PTHREAD_MUTEX_INITIALIZER;
+// Serializes read-modify-write of file contents (WRITE commit, UNDO restore)
+static pthread_mutex_t G_COMMIT_MUTEX = PTHREAD_MUTEX_INITIALIZER;
 
 // Helper functions for sentence-level locking
 static bool lock_sentence(FileRec *fr, int sentence_idx, const char *user, int owner_fd) {
@@ -298,6 +300,7 @@ static void *client_thread(void *arg) {
                     break;
                 }
                 if (strcmp(edit, "ETIRW") == 0) {
+                    pthread_mutex_lock(&G_COMMIT_MUTEX);
                     // CRITICAL: Re-read file to get current state (handles concurrent writes)
                     // Other users may have modified other sentences while we held the lock on this sentence
                     free(content); // Free stale content
@@ -400,6 +403,7 @@ static void *client_thread(void *arg) {
                     // save and unlock
                     size_t clen = strlen(content);
                     fu_write_all(fr->path, content, clen);
+                    pthread_mutex_unlock(&G_COMMIT_MUTEX);
                     unlock_sentence(fr, sidx, user);
                     log_info("WRITE commit %s sidx=%d by %s -> len=%zu sentences=%d%s", 
                              fname, sidx, user, clen, sc,
@@ -477,10 +481,11 @@ static void *client_thread(void *arg) {
                     memcpy(sent_copy, sent_beg[sidx], sent_len[sidx]);
                     sent_copy[sent_len[sidx]] = '\0';
                     
-                    char *word = strtok(sent_copy, " \t\r\n");
+                    char *save_w = NULL;
+                    char *word = strtok_r(sent_copy, " \t\r\n", &save_w);
                     while (word) {
                         max_word_idx++;
-                        word = strtok(NULL, " \t\r\n");
+                        word = strtok_r(NULL, " \t\r\n", &save_w);
                     }
                     free(sent_copy);
                 }
@@ -525,7 +530,9 @@ static void *client_thread(void *arg) {
             
             // Restore the content from the flashcard
             size_t restored_len = strlen(restored_content);
+            pthread_mutex_lock(&G_COMMIT_MUTEX);
             fu_write_all(fr->path, restored_content, restored_len);
+            pthread_mutex_unlock(&G_COMMIT_MUTEX);
             log_info("UNDO %s - restored to state before write by %s (len=%zu)", 
                      tok[1], undo_user, restored_len);
             free(restored_content);
@@ -561,15 +568,16 @@ static void *client_thread(void *arg) {
                 FILE *f = fopen(tmppath, "w");
                 if (!f) { proto_send_err(fd, ERR_INTERNAL, "Open temp fail"); continue; }
                 size_t wlen = 0;
+                int lines_written = 0;
                 char sync_line[PROTO_MAX_LINE];
                 while (1) {
                     ssize_t sn = su_recv_line(fd, sync_line, sizeof(sync_line));
-                    if (sn <= 0) { fclose(f); unlink(tmppath); proto_send_err(fd, ERR_INTERNAL, "Sync read fail"); goto after_sync; }
+                    if (sn < 0) { fclose(f); unlink(tmppath); proto_send_err(fd, ERR_INTERNAL, "Sync read fail"); goto after_sync; }
                     if (strcmp(sync_line, ".") == 0) break;
                     size_t l = strlen(sync_line);
+                    if (lines_written > 0) { if (fputc('\n', f) == EOF) { fclose(f); unlink(tmppath); proto_send_err(fd, ERR_INTERNAL, "Write temp fail"); goto after_sync; } wlen++; }
                     if (fwrite(sync_line, 1, l, f) != l) { fclose(f); unlink(tmppath); proto_send_err(fd, ERR_INTERNAL, "Write temp fail"); goto after_sync; }
-                    if (fputc('\n', f) == EOF) { fclose(f); unlink(tmppath); proto_send_err(fd, ERR_INTERNAL, "Write temp fail"); goto after_sync; }
-                    wlen += l + 1;
+                    wlen += l; lines_written++;
                 }
                 fclose(f);
                 // Replace the original file atomically
